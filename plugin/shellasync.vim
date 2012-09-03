@@ -1,9 +1,9 @@
 " shellasync.vim plugin for asynchronously executing shell commands in vim
 " Maintainer: Dmitry "troydm" Geurkov <d.geurkov@gmail.com>
-" Version: 0.1
+" Version: 0.3.3
 " Description: shellasync.vim plugin allows you to execute shell commands
 " asynchronously inside vim and see output in seperate buffer window.
-" Last Change: 20 August, 2012
+" Last Change: 27 August, 2012
 " License: Vim License (see :help license)
 " Website: https://github.com/troydm/shellasync.vim
 "
@@ -23,18 +23,65 @@ import vim, sys, os, subprocess, threading, signal, time, fcntl
 
 shellasync_cmds = {}
 shellasync_pids = {}
+shellasync_bufs = {}
 
-def ExecuteCmd(cmd,print_retval):
-    global shellasync_cmds,shellasync_pids
-    print_retval = print_retval == 1
-    if TermCmd(cmd):
-        shellasync_cmds[cmd] = threading.Thread(target=ExecuteInSubprocess, args=(cmd,print_retval,))
+class ShellAsyncOutput:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.output = []
+    
+    def get(self):
+        self.lock.acquire()
+        r = self.output
+        self.output = []
+        self.lock.release()
+        return r
+
+    def extend(self,data):
+        self.lock.acquire()
+        self.output.extend(data)
+        self.lock.release()
+
+def ShellAsyncRefreshOutput():
+    global shellasync_bufs,shellasync_pids
+    cmd = vim.eval("getbufvar('%','command')")
+    if cmd in shellasync_bufs:
+        out = shellasync_bufs[cmd]
+        if out != None:
+            out = out.get()
+            if len(out) > 0:
+                if len(vim.current.buffer) == 1 and len(vim.current.buffer[0]) == 0:
+                    vim.current.buffer[0] = out[0]
+                    out = out[1:]
+                    if len(out) > 0:
+                        vim.current.buffer.append(out)
+                else:
+                    vim.current.buffer.append(out)
+                vim.command("call setpos('.',["+str(vim.current.buffer.number)+","+str(len(vim.current.buffer))+",0,0])")
+            else:
+                if not cmd in shellasync_pids:
+                    shellasync_bufs.pop(cmd)                    
+    vim.command("call feedkeys(\"f\e\")")
+
+def ShellAsyncExecuteCmd():
+    global shellasync_cmds
+    print_retval = vim.eval("g:shellasync_print_return_value") == '1'
+    cmd = vim.eval("command")
+    if ShellAsyncTermCmd():
+        ShellAsyncRefreshOutput()
+        vim.command("normal ggdGG")
+        vim.command("silent! refresh!")
+        shellasync_cmds[cmd] = threading.Thread(target=ShellAsyncExecuteInSubprocess, args=(cmd,print_retval,))
         shellasync_cmds[cmd].start()
 
-def TermCmd(cmd):
+def ShellAsyncTermCmd():
     global shellasync_cmds,shellasync_pids
+    cmd = vim.eval("command")
     if cmd in shellasync_cmds and cmd in shellasync_pids:
-        os.kill(shellasync_pids[cmd],signal.SIGTERM)
+        try:
+            os.killpg(shellasync_pids[cmd],signal.SIGTERM)
+        except OSError:
+            os.kill(shellasync_pids[cmd],signal.SIGTERM)
         if cmd in shellasync_cmds:
             shellasync_cmds[cmd].join(15.0)
             if cmd in shellasync_pids:
@@ -42,10 +89,14 @@ def TermCmd(cmd):
                 return False
     return True
 
-def KillCmd(cmd):
+def ShellAsyncKillCmd():
     global shellasync_cmds,shellasync_pids
+    cmd = vim.eval("command")
     if cmd in shellasync_cmds and cmd in shellasync_pids:
-        os.kill(shellasync_pids[cmd],signal.SIGKILL)
+        try:
+            os.killpg(shellasync_pids[cmd],signal.SIGKILL)
+        except OSError:
+            os.kill(shellasync_pids[cmd],signal.SIGKILL)
         if cmd in shellasync_cmds:
             shellasync_cmds[cmd].join(15.0)
             if cmd in shellasync_pids:
@@ -53,81 +104,106 @@ def KillCmd(cmd):
                 return False
     return True
 
-def ExecuteInSubprocess(cmd,print_retval):
+def ShellAsyncTermAllCmds():
     global shellasync_cmds,shellasync_pids
-    p = subprocess.Popen(cmd+" 2>&1", shell=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for cmd in list(shellasync_pids.keys()):
+        try:
+            os.killpg(shellasync_pids[cmd],signal.SIGTERM)
+        except OSError:
+            os.kill(shellasync_pids[cmd],signal.SIGTERM)
+        if cmd in shellasync_cmds:
+            shellasync_cmds[cmd].join(15.0)
+            if cmd in shellasync_pids:
+                try:
+                    os.killpg(shellasync_pids[cmd],signal.SIGKILL)
+                except OSError:
+                    os.kill(shellasync_pids[cmd],signal.SIGKILL)
+                shellasync_cmds[cmd].join(5.0)
+
+def ShellAsyncExecuteInSubprocess(cmd,print_retval):
+    global shellasync_cmds,shellasync_pids,shellasync_bufs
+    p = subprocess.Popen(cmd+" 2>&1", shell=True, preexec_fn=os.setsid, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     fcntl.fcntl(p.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
     shellasync_pids[cmd] = p.pid
-    time.sleep(0.5)
     retval = None
     out = ''
-    first = True
-    buf = vim.current.buffer
-    try:
-        vim.command("normal dGG")
-        vim.command("silent! redraw!")
-    except vim.error:
-        pass
+    shellasync_bufs[cmd] = ShellAsyncOutput()
+    buf = shellasync_bufs[cmd]
     while True:
         try:
             outread = p.stdout.read()
-            if len(outread) > 0:
+            if len(outread) == 0:
+                retval = p.poll()
+                if retval != None:
+                    break
+                else:
+                    time.sleep(0.25)
+            else:
                 out += outread
                 while out.find("\n") != -1:
                     out = out.split("\n")
                     lines = out[:-1]
                     out = out[-1]
-                    try:
-                        if first:
-                            buf[0] = lines[0]
-                            first = False
-                            lines = lines[1:]
-                            if len(lines) > 0:
-                                buf.append(lines)
-                        else:
-                            buf.append(lines)
-                    except vim.error:
-                        pass
-                try:
-                    if vim.current.buffer.number == buf.number:
-                        vim.command("call setpos('.',["+str(buf.number)+","+str(len(buf))+",0,0])")
-                    vim.command("silent! redraw!")
-                except vim.error:
-                    pass
-            else:
-                retval = p.poll()
-                if retval != None:
-                    shellasync_pids.pop(cmd)
-                    break
+                    buf.extend(lines)
         except IOError:
             pass
-        time.sleep(0.5)
-    try:
-        if len(out) > 0:
-            buf.append(out)
-        if print_retval:
-            buf.append(["","Shell command "+cmd+" completed with return value "+str(retval)])
-        vim.command("silent! redraw!")
-    except vim.error:
-        pass
+    if len(out) > 0:
+        buf.extend(out)
+    if print_retval:
+        buf.extend(["","Shell command "+cmd+" completed with return value "+str(retval)])
     shellasync_cmds.pop(cmd)
+    shellasync_pids.pop(cmd)
 EOF
 
-function! s:ExecuteInShell(command)
-    let command = join(map(split(a:command), 'expand(v:val)'))
+function! s:ExpandCommand(command)
+    return join(map(split(a:command), 'expand(v:val)'))
+endfunction
+function! s:ExecuteInShell(bang, command)
+    if a:bang == '!'
+        let command = s:ExpandCommand(a:command)
+    else
+        let command = a:command
+    endif
     let winnr = bufwinnr('^' . command . '$')
     if winnr < 0
         execute &lines/3 . 'sp ' . fnameescape(command)
-        setlocal buftype=nowrite bufhidden=wipe nobuflisted noswapfile nowrap
-        exe "au BufWipeout <buffer> ShellTerm ".command
-        exe "python ExecuteCmd('".command."',".g:shellasync_print_return_value.")"
+        setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile nowrap
+        call setbufvar("%","prevupdatetime",&updatetime)
+        call setbufvar("%","command",command)
+        set updatetime=500
+        au BufWipeout <buffer> call s:TermShellInBuf()
+        au BufEnter <buffer> set updatetime=500
+        au BufLeave <buffer> let &updatetime=getbufvar('%','prevupdatetime')
+        au CursorHold <buffer> python ShellAsyncRefreshOutput()
+        python ShellAsyncExecuteCmd()
     else
         exe winnr . 'wincmd w'
-        exe "python ExecuteCmd('".command."',".g:shellasync_print_return_value.")"
+        python ShellAsyncExecuteCmd()
     endif
 endfunction
-command! -complete=shellcmd -nargs=+ Shell call s:ExecuteInShell(<q-args>)
-command! -complete=shellcmd -nargs=+ ShellTerm python TermCmd(<q-args>)
-command! -complete=shellcmd -nargs=+ ShellKill python KillCmd(<q-args>)
+function! s:TermShell(bang,command)
+    if a:bang == '!'
+        let command = s:ExpandCommand(a:command)
+    else
+        let command = a:command
+    endif
+    python ShellAsyncTermCmd()
+endfunction
+function! s:TermShellInBuf()
+    let command = getbufvar('%','command')
+    python ShellAsyncTermCmd()
+endfunction
+function! s:KillShell(bang,command)
+    if a:bang == '!'
+        let command = s:ExpandCommand(a:command)
+    else
+        let command = a:command
+    endif
+    python ShellAsyncKillCmd()
+endfunction
+command! -complete=shellcmd -bang -nargs=+ Shell call s:ExecuteInShell('<bang>',<q-args>)
+command! -complete=shellcmd -bang -nargs=+ ShellTerm call s:TermShell('<bang>',<q-args>)
+command! -complete=shellcmd -bang -nargs=+ ShellKill call s:KillShell('<bang>',<q-args>)
 command! ShellsRunning python print shellasync_pids
+au VimLeavePre * python ShellAsyncTermAllCmds()
 
